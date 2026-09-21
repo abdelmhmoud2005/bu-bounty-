@@ -82,30 +82,32 @@ jobs:
       # 4. أدوات Recon إضافية
       #    ⬇️ تم تطبيق الحل الثالث + || true على jsubfinder
       # ============================================================
-      - name: Install additional recon tools
-        continue-on-error: true   # 👈 السماح للخطوة بالفشل دون إيقاف باقي الخطوات
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          go install github.com/lc/gau/v2/cmd/gau@latest
-          go install github.com/tomnomnom/waybackurls@latest
-          go install github.com/jaeles-project/gospider@latest
-          go install github.com/hakluke/hakrawler@latest
-          go install github.com/lc/subjs@latest
-          go install github.com/003random/getJS@latest
-          go install github.com/ffuf/ffuf/v2@latest
-          go install github.com/tomnomnom/qsreplace@latest
-          go install github.com/tomnomnom/assetfinder@latest
-          go install github.com/haccer/subjack@latest
-          # 👇 تم تجاوز أداة jsubfinder إذا فشلت
-          go install github.com/Th1Hu/jsubfinder/cmd/jsubfinder@latest || true
-          go install github.com/hahwul/dalfox/v2@latest
-          go install github.com/Emoe/kxss@latest
-          go install github.com/tomnomnom/anew@latest
-          go install github.com/tomnomnom/gf@latest
-          go install github.com/tomnomnom/unfurl@latest
-          go install github.com/zricethezav/gitleaks/v8@v8.30.0
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
-
+    # ============================================================
+# 4. أدوات Recon إضافية
+#    تم تصحيح مسار jsubfinder إلى المسار الأصلي الصحيح
+# ============================================================
+- name: Install additional recon tools
+  run: |
+    export PATH="$HOME/go/bin:$PATH"
+    go install github.com/lc/gau/v2/cmd/gau@latest
+    go install github.com/tomnomnom/waybackurls@latest
+    go install github.com/jaeles-project/gospider@latest
+    go install github.com/hakluke/hakrawler@latest
+    go install github.com/lc/subjs@latest
+    go install github.com/003random/getJS@latest
+    go install github.com/ffuf/ffuf/v2@latest
+    go install github.com/tomnomnom/qsreplace@latest
+    go install github.com/tomnomnom/assetfinder@latest
+    go install github.com/haccer/subjack@latest
+    # ✅ المسار الصحيح والصحيح الوحيد لـ jsubfinder
+    go install github.com/ThreatUnkown/jsubfinder@latest
+    go install github.com/hahwul/dalfox/v2@latest
+    go install github.com/Emoe/kxss@latest
+    go install github.com/tomnomnom/anew@latest
+    go install github.com/tomnomnom/gf@latest
+    go install github.com/tomnomnom/unfurl@latest
+    go install github.com/zricethezav/gitleaks/v8@v8.30.0
+    echo "$HOME/go/bin" >> "$GITHUB_PATH"
       # ============================================================
       # 5. Gf Patterns
       # ============================================================
