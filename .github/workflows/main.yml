@@ -33,7 +33,7 @@ jobs:
       - name: Subdomain enumeration
         run: |
           subfinder \
-            -d mtn.com/ \
+            -d accellion.com / \
             -silent \
             -all \
             -o results/subdomains/subdomains.txt
