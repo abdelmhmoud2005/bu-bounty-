@@ -1,0 +1,46 @@
+name: Bug Bounty Recon
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y golang
+
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Enumerate subdomains
+        run: |
+          mkdir -p results
+
+          subfinder \
+            -d https://www.23andme.org/ \
+            -silent \
+            -o results/subdomains.txt
+
+      - name: Run Nuclei
+        run: |
+          nuclei \
+            -l results/subdomains.txt \
+            -severity medium,high,critical \
+            -o results/nuclei.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-results
+          path: results/
