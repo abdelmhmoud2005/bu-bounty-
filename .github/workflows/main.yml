@@ -40,7 +40,7 @@ jobs:
     steps:
 
       # ============================================================
-      # 1. الاعتماديات الأساسية (Docker مثبت مسبقًا)
+      # 1. الاعتماديات الأساسية (بدون golang)
       # ============================================================
       - name: Install system dependencies
         run: |
@@ -48,11 +48,23 @@ jobs:
           sudo apt-get install -y \
             git curl wget jq unzip \
             python3 python3-pip python3-venv \
-            golang nodejs npm nmap \
+            nodejs npm nmap \
             libpcap-dev
 
       # ============================================================
-      # 2. أدوات ProjectDiscovery
+      # 2. تثبيت Go 1.25 (الحل النهائي)
+      # ============================================================
+      - name: Setup Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Verify Go version
+        run: go version
+
+      # ============================================================
+      # 3. أدوات ProjectDiscovery
       # ============================================================
       - name: Install ProjectDiscovery tools
         run: |
@@ -67,127 +79,94 @@ jobs:
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       # ============================================================
-      # 3. أدوات Recon إضافية
+      # 4. أدوات Recon إضافية
       # ============================================================
       - name: Install additional recon tools
         run: |
           export PATH="$HOME/go/bin:$PATH"
-          # URL & Crawling
           go install github.com/lc/gau/v2/cmd/gau@latest
           go install github.com/tomnomnom/waybackurls@latest
           go install github.com/jaeles-project/gospider@latest
           go install github.com/hakluke/hakrawler@latest
-
-          # JS extraction
           go install github.com/lc/subjs@latest
           go install github.com/003random/getJS@latest
-
-          # Fuzzing & Params
           go install github.com/ffuf/ffuf/v2@latest
           go install github.com/tomnomnom/qsreplace@latest
-
-          # Subdomain helpers
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/haccer/subjack@latest
           go install github.com/Th1Hu/jsubfinder/cmd/jsubfinder@latest
-
-          # XSS & Vulns
           go install github.com/hahwul/dalfox/v2@latest
           go install github.com/Emoe/kxss@latest
-
-          # Utilities
           go install github.com/tomnomnom/anew@latest
           go install github.com/tomnomnom/gf@latest
           go install github.com/tomnomnom/unfurl@latest
-
-          # ✅ Gitleaks بالمسار القديم
           go install github.com/zricethezav/gitleaks/v8@v8.30.0
-
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       # ============================================================
-      # 4. Gf Patterns (أنماط البحث عن الثغرات)
+      # 5. Gf Patterns
       # ============================================================
       - name: Install Gf patterns
         run: |
           mkdir -p "$HOME/.gf"
           git clone --depth 1 https://github.com/1ndianl33t/Gf-Patterns.git /tmp/gf-patterns
           cp /tmp/gf-patterns/*.json "$HOME/.gf/" || true
-          # إضافة أنماط شائعة
           cat > "$HOME/.gf/xss.json" << 'EOF'
           {
             "flags": "-iE",
-            "patterns": [
-              "(q|s|search|query|keyword|url|redirect|return|next|callback|path|file|load|src|dest|uri|link|view|page|action|do)="
-            ]
+            "patterns": ["(q|s|search|query|keyword|url|redirect|return|next|callback|path|file|load|src|dest|uri|link|view|page|action|do)="]
           }
           EOF
           cat > "$HOME/.gf/sqli.json" << 'EOF'
           {
             "flags": "-iE",
-            "patterns": [
-              "(id|select|report|role|update|query|user|name|sort|where|search|params|process|row|view|table|from|sel|results|sleep|fetch)="
-            ]
+            "patterns": ["(id|select|report|role|update|query|user|name|sort|where|search|params|process|row|view|table|from|sel|results|sleep|fetch)="]
           }
           EOF
           cat > "$HOME/.gf/ssrf.json" << 'EOF'
           {
             "flags": "-iE",
-            "patterns": [
-              "(url|uri|redirect|path|continue|window|next|data|reference|site|html|val|validate|domain|callback|return|page|feed|host|port|to|out|view|dir)="
-            ]
+            "patterns": ["(url|uri|redirect|path|continue|window|next|data|reference|site|html|val|validate|domain|callback|return|page|feed|host|port|to|out|view|dir)="]
           }
           EOF
           cat > "$HOME/.gf/lfi.json" << 'EOF'
           {
             "flags": "-iE",
-            "patterns": [
-              "(file|document|folder|root|path|pg|style|pdf|template|php_path|doc|page|name|cat|dir|action|board|date|detail|download|prefix|include|inc|locate|show|site|type|view)="
-            ]
+            "patterns": ["(file|document|folder|root|path|pg|style|pdf|template|php_path|doc|page|name|cat|dir|action|board|date|detail|download|prefix|include|inc|locate|show|site|type|view)="]
           }
           EOF
           cat > "$HOME/.gf/redirect.json" << 'EOF'
           {
             "flags": "-iE",
-            "patterns": [
-              "(url|redirect|next|return|target|rurl|dest|destination|redir|redirect_uri|redirect_url|redirect_uri|goto|out|view|login|logout|continue)="
-            ]
+            "patterns": ["(url|redirect|next|return|target|rurl|dest|destination|redir|redirect_uri|redirect_url|goto|out|view|login|logout|continue)="]
           }
           EOF
           cat > "$HOME/.gf/interestingparams.json" << 'EOF'
           {
             "flags": "-iE",
-            "patterns": [
-              "(token|key|secret|password|pwd|auth|session|api|debug|test|admin|role|config|dbg|dev|env|log|logfile|trace|debug|cmd|exec|command|shell|system|eval|load|upload|download|read|write|include)="
-            ]
+            "patterns": ["(token|key|secret|password|pwd|auth|session|api|debug|test|admin|role|config|dbg|dev|env|log|logfile|trace|debug|cmd|exec|command|shell|system|eval|load|upload|download|read|write|include)="]
           }
           EOF
 
       # ============================================================
-      # 5. أدوات Python (JS Analysis + Arjun + Corsy + Dnsgen)
+      # 6. أدوات Python
       # ============================================================
       - name: Install Python tools
         run: |
           python3 -m pip install --break-system-packages \
-            uro \
-            jsbeautifier \
-            arjun \
-            dnsgen
+            uro jsbeautifier arjun dnsgen
 
-          # LinkFinder
           git clone --depth 1 https://github.com/GerbenJavado/LinkFinder.git /tmp/linkfinder
           cd /tmp/linkfinder && python3 -m pip install --break-system-packages -r requirements.txt
 
-          # SecretFinder
           git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /tmp/secretfinder
           cd /tmp/secretfinder && python3 -m pip install --break-system-packages -r requirements.txt
 
-          # Corsy
           git clone --depth 1 https://github.com/s0md3v/Corsy.git /opt/corsy
           cd /opt/corsy && python3 -m pip install --break-system-packages -r requirements.txt
 
       # ============================================================
-      # 6. TruffleHog
+      # 7. TruffleHog
       # ============================================================
       - name: Install TruffleHog
         run: |
@@ -195,13 +174,13 @@ jobs:
             | sh -s -- -b /usr/local/bin
 
       # ============================================================
-      # 7. Retire.js
+      # 8. Retire.js
       # ============================================================
       - name: Install Retire.js
         run: npm install -g retire
 
       # ============================================================
-      # 8. SQLMap
+      # 9. SQLMap
       # ============================================================
       - name: Install SQLMap
         run: |
@@ -209,7 +188,7 @@ jobs:
           echo "SQLMAP_PATH=/opt/sqlmap/sqlmap.py" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 9. XSStrike
+      # 10. XSStrike
       # ============================================================
       - name: Install XSStrike
         run: |
@@ -217,14 +196,11 @@ jobs:
           cd /opt/xsstrike && python3 -m pip install --break-system-packages -r requirements.txt
 
       # ============================================================
-      # 10. Subjack wordlist + Dnsgen wordlist
+      # 11. Wordlists
       # ============================================================
       - name: Prepare wordlists
         run: |
-          # Subjack fingerprints
           wget -q https://raw.githubusercontent.com/haccer/subjack/master/fingerprints.json -O /tmp/fingerprints.json || true
-
-          # Small directory wordlist for ffuf
           cat > /tmp/common.txt << 'EOF'
           admin
           api
@@ -248,14 +224,14 @@ jobs:
           EOF
 
       # ============================================================
-      # 11. تحضير مساحة العمل
+      # 12. تحضير مساحة العمل
       # ============================================================
       - name: Prepare workspace
         run: |
           mkdir -p results/{subdomains,dns,http,ports,urls,js,js/files,params,secrets,nuclei,zap,sqlmap,xss,retire,linkfinder,secretfinder,trufflehog,gospider,arjun,corsy,kxss,subjack,jsubfinder,gf}
 
       # ============================================================
-      # 12. التحقق من الهدف
+      # 13. التحقق من الهدف
       # ============================================================
       - name: Verify target
         run: |
@@ -267,43 +243,25 @@ jobs:
           echo "$TARGET" > results/target.txt
 
       # ============================================================
-      # 13. تعداد النطاقات الفرعية (Subfinder + Assetfinder + Dnsgen + Alterx)
+      # 14. تعداد النطاقات الفرعية
       # ============================================================
       - name: Subdomain enumeration
         run: |
-          # Subfinder
           subfinder -d "$TARGET" -silent -all -o results/subdomains/subfinder.txt || true
-
-          # Assetfinder
           assetfinder --subs-only "$TARGET" > results/subdomains/assetfinder.txt || true
-
-          # Merge initial subdomains
           cat results/subdomains/subfinder.txt results/subdomains/assetfinder.txt 2>/dev/null \
             | grep -v '^\s*$' | sort -u > results/subdomains/base.txt
-
-          # Dnsgen — توليد نطاقات محتملة
           cat results/subdomains/base.txt | dnsgen - > results/subdomains/dnsgen.txt || true
-
-          # Alterx — توليد permutations متقدمة
           cat results/subdomains/base.txt | alterx -silent > results/subdomains/alterx.txt || true
-
-          # Merge all
           cat results/subdomains/base.txt results/subdomains/dnsgen.txt results/subdomains/alterx.txt 2>/dev/null \
             | sort -u > results/subdomains/all-raw.txt
-
-          # Resolve via dnsx
-          dnsx -l results/subdomains/all-raw.txt -silent -a -resp-only 2>/dev/null \
-            | sort -u > results/subdomains/resolved-ips.txt || true
-
-          # Final resolved subdomains
           dnsx -l results/subdomains/all-raw.txt -silent -a -resp 2>/dev/null \
             | awk '{print $1}' | sort -u > results/subdomains/all.txt || true
-
           echo "Total raw: $(wc -l < results/subdomains/all-raw.txt)"
           echo "Total resolved: $(wc -l < results/subdomains/all.txt)"
 
       # ============================================================
-      # 14. DNS Resolution التفصيلي
+      # 15. DNS Resolution
       # ============================================================
       - name: DNS resolution
         run: |
@@ -313,7 +271,7 @@ jobs:
           fi
 
       # ============================================================
-      # 15. Subdomain Takeover (Subjack)
+      # 16. Subdomain Takeover
       # ============================================================
       - name: Subdomain takeover check
         run: |
@@ -324,7 +282,7 @@ jobs:
           fi
 
       # ============================================================
-      # 16. HTTP Probing (httpx)
+      # 17. HTTP Probing
       # ============================================================
       - name: HTTP probing
         run: |
@@ -333,20 +291,18 @@ jobs:
             -status-code -title -tech-detect -web-server \
             -content-length -location -cname \
             -o results/http/httpx.txt || true
-
           if [ -s results/http/httpx.txt ]; then
             awk '{print $1}' results/http/httpx.txt | sort -u > results/http/live.txt
           fi
 
       # ============================================================
-      # 17. فحص المنافذ (Naabu + Nmap)
+      # 18. فحص المنافذ
       # ============================================================
       - name: Port scanning
         run: |
           if [ -s results/subdomains/all.txt ]; then
             naabu -list results/subdomains/all.txt -top-ports 100 \
               -rate "$RATE_LIMIT" -silent -o results/ports/naabu.txt || true
-
             if [ -s results/ports/naabu.txt ]; then
               awk -F: '{print $1}' results/ports/naabu.txt | sort -u > results/ports/ips.txt
               nmap -sV --top-ports 30 -iL results/ports/ips.txt \
@@ -355,7 +311,7 @@ jobs:
           fi
 
       # ============================================================
-      # 18. جمع URLs التاريخية
+      # 19. جمع URLs التاريخية
       # ============================================================
       - name: Historical URLs
         run: |
@@ -365,7 +321,7 @@ jobs:
           fi
 
       # ============================================================
-      # 19. زحف Katana
+      # 20. زحف Katana
       # ============================================================
       - name: Katana crawl
         run: |
@@ -375,7 +331,7 @@ jobs:
           fi
 
       # ============================================================
-      # 20. زحف Gospider
+      # 21. زحف Gospider
       # ============================================================
       - name: Gospider crawl
         run: |
@@ -383,14 +339,12 @@ jobs:
             gospider -S results/http/live.txt -c 10 -d 3 \
               -t 20 --sitemap --robots --other-source --include-subs \
               -o results/gospider/ 2>/dev/null || true
-
-            # استخراج URLs من المخرجات
             find results/gospider -name '*.txt' -exec cat {} \; 2>/dev/null \
               | grep -oE 'https?://[^ ]+' | sort -u > results/urls/gospider.txt || true
           fi
 
       # ============================================================
-      # 21. دمج وتنقية URLs
+      # 22. دمج URLs
       # ============================================================
       - name: Merge URLs
         run: |
@@ -399,14 +353,12 @@ jobs:
           cat results/urls/gau.txt results/urls/wayback.txt \
               results/urls/katana.txt results/urls/gospider.txt \
             | sort -u > results/urls/all-raw.txt
-
           cat results/urls/all-raw.txt | uro > results/urls/all.txt \
             || cp results/urls/all-raw.txt results/urls/all.txt
-
           echo "URLs: $(wc -l < results/urls/all.txt)"
 
       # ============================================================
-      # 22. تصنيف URLs بـ Gf Patterns
+      # 23. Gf Classification
       # ============================================================
       - name: Gf classification
         run: |
@@ -416,43 +368,35 @@ jobs:
           done
 
       # ============================================================
-      # 23. استخراج المعاملات
+      # 24. استخراج Parameters
       # ============================================================
       - name: Extract parameters
         run: |
           grep '?' results/urls/all.txt | sort -u > results/params/parameterized.txt || true
           grep -Eoi '(url|uri|redirect|next|return|callback|file|path|page|id|query|search|q|cmd|exec|template|load|src|dest)' \
             results/params/parameterized.txt | sort -u > results/params/interesting.txt || true
-
-          # استخراج أسماء المعاملات الفريدة
           cat results/params/parameterized.txt \
             | unfurl -u keys 2>/dev/null | tr ',' '\n' | sort -u \
             > results/params/unique-keys.txt || true
 
       # ============================================================
-      # 24. استخراج JS URLs (Subjs + GetJS)
+      # 25. استخراج JS
       # ============================================================
       - name: Extract JS URLs
         run: |
-          # من قائمة URLs
           grep -Ei '\.js([?#].*)?$' results/urls/all.txt | sort -u > results/js/javascript.txt || true
-
-          # Subjs على hosts الحية
           if [ -s results/http/live.txt ]; then
             cat results/http/live.txt | subjs >> results/js/javascript.txt 2>/dev/null || true
           fi
-
-          # GetJS
           if [ -s results/http/live.txt ]; then
             while read -r host; do
               getJS --url "$host" --complete 2>/dev/null >> results/js/javascript.txt || true
             done < results/http/live.txt
           fi
-
           sort -u results/js/javascript.txt -o results/js/javascript.txt
 
       # ============================================================
-      # 25. تحميل ملفات JS
+      # 26. تحميل JS
       # ============================================================
       - name: Download JS
         run: |
@@ -466,7 +410,7 @@ jobs:
           echo "Downloaded: $(ls results/js/files | wc -l) JS files"
 
       # ============================================================
-      # 26. LinkFinder — استخراج Endpoints
+      # 27. LinkFinder
       # ============================================================
       - name: LinkFinder
         run: |
@@ -480,7 +424,7 @@ jobs:
           fi
 
       # ============================================================
-      # 27. SecretFinder — البحث عن الأسرار
+      # 28. SecretFinder
       # ============================================================
       - name: SecretFinder
         run: |
@@ -494,7 +438,7 @@ jobs:
           fi
 
       # ============================================================
-      # 28. JSubFinder — استخراج Subdomains من JS
+      # 29. JSubFinder
       # ============================================================
       - name: JSubFinder
         run: |
@@ -504,23 +448,21 @@ jobs:
           fi
 
       # ============================================================
-      # 29. Grep للأسرار في JS
+      # 30. Grep للأسرار
       # ============================================================
       - name: Grep secrets in JS
         run: |
           grep -RniE \
             'api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|authorization|bearer|password|private[_-]?key|aws_access|firebase|graphql|websocket|internal[_-]?api|stripe|paypal|twilio|sendgrid' \
             results/js/files > results/secrets/js-interesting.txt 2>/dev/null || true
-
           grep -RniE \
             '(s3\.|storage\.googleapis|blob\.core\.windows|firebaseio|amazonaws|cloudfront|herokuapp|azurewebsites|digitaloceanspaces)' \
             results/js/files > results/secrets/cloud-urls.txt 2>/dev/null || true
-
           grep -RniE 'sourceMappingURL=' results/js/files \
             > results/js/sourcemaps.txt 2>/dev/null || true
 
       # ============================================================
-      # 30. TruffleHog على JS
+      # 31. TruffleHog
       # ============================================================
       - name: TruffleHog
         run: |
@@ -530,7 +472,7 @@ jobs:
           fi
 
       # ============================================================
-      # 31. Retire.js — إصدارات JS القديمة
+      # 32. Retire.js
       # ============================================================
       - name: Retire.js
         run: |
@@ -542,7 +484,7 @@ jobs:
           fi
 
       # ============================================================
-      # 32. Arjun — اكتشاف المعاملات المخفية
+      # 33. Arjun
       # ============================================================
       - name: Arjun hidden parameters
         if: ${{ github.event.inputs.active_scan == 'true' }}
@@ -555,7 +497,7 @@ jobs:
           fi
 
       # ============================================================
-      # 33. Kxss — اكتشاف انعكاس XSS
+      # 34. Kxss
       # ============================================================
       - name: Kxss reflected XSS
         run: |
@@ -568,7 +510,7 @@ jobs:
           fi
 
       # ============================================================
-      # 34. Corsy — فحص CORS
+      # 35. Corsy
       # ============================================================
       - name: Corsy CORS check
         run: |
@@ -579,13 +521,13 @@ jobs:
           fi
 
       # ============================================================
-      # 35. Nuclei Templates
+      # 36. Nuclei Templates
       # ============================================================
       - name: Update Nuclei templates
         run: nuclei -update-templates -silent || true
 
       # ============================================================
-      # 36. Nuclei Scan (كامل)
+      # 37. Nuclei Scan
       # ============================================================
       - name: Nuclei scan
         run: |
@@ -599,7 +541,7 @@ jobs:
           fi
 
       # ============================================================
-      # 37. Nuclei DAST (Fuzzing على Parameters)
+      # 38. Nuclei DAST
       # ============================================================
       - name: Nuclei DAST fuzzing
         if: ${{ github.event.inputs.active_scan == 'true' }}
@@ -607,15 +549,14 @@ jobs:
           if [ -s results/params/parameterized.txt ]; then
             head -50 results/params/parameterized.txt > /tmp/dast_targets.txt
             nuclei -l /tmp/dast_targets.txt \
-              -dast \
-              -severity low,medium,high,critical \
+              -dast -severity low,medium,high,critical \
               -exclude-tags dos \
               -rate-limit 10 -c 3 \
               -o results/nuclei/nuclei-dast.txt || true
           fi
 
       # ============================================================
-      # 38. SQLMap (اختياري)
+      # 39. SQLMap
       # ============================================================
       - name: SQLMap scan
         if: ${{ github.event.inputs.enable_sqlmap == 'true' }}
@@ -635,7 +576,7 @@ jobs:
           fi
 
       # ============================================================
-      # 39. Dalfox XSS (مع Pipe مباشر)
+      # 40. Dalfox XSS
       # ============================================================
       - name: Dalfox XSS
         if: ${{ github.event.inputs.enable_dalfox == 'true' }}
@@ -652,7 +593,7 @@ jobs:
           fi
 
       # ============================================================
-      # 40. XSStrike (اختياري)
+      # 41. XSStrike
       # ============================================================
       - name: XSStrike XSS
         if: ${{ github.event.inputs.enable_dalfox == 'true' }}
@@ -666,7 +607,7 @@ jobs:
           fi
 
       # ============================================================
-      # 41. FFUF Directory Fuzzing (اختياري)
+      # 42. FFUF
       # ============================================================
       - name: FFUF directory fuzzing
         if: ${{ github.event.inputs.active_scan == 'true' }}
@@ -682,7 +623,7 @@ jobs:
           fi
 
       # ============================================================
-      # 42. OWASP ZAP Baseline
+      # 43. ZAP Baseline
       # ============================================================
       - name: ZAP baseline
         run: |
@@ -697,7 +638,7 @@ jobs:
             -m 10 || true
 
       # ============================================================
-      # 43. OWASP ZAP Active
+      # 44. ZAP Active
       # ============================================================
       - name: ZAP active scan
         if: ${{ github.event.inputs.active_scan == 'true' }}
@@ -713,7 +654,7 @@ jobs:
             -m 30 || true
 
       # ============================================================
-      # 44. الملخص النهائي
+      # 45. Summary
       # ============================================================
       - name: Create summary
         run: |
@@ -768,7 +709,7 @@ jobs:
           } > results/SUMMARY.md
 
       # ============================================================
-      # 45. رفع النتائج
+      # 46. Upload
       # ============================================================
       - name: Upload results
         uses: actions/upload-artifact@v4
