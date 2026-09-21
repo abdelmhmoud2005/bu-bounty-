@@ -1,82 +1,529 @@
-name: Bug Bounty Recon
+name: Full Security Assessment
 
 on:
   workflow_dispatch:
+    inputs:
+      active_scan:
+        description: "Enable active security testing (SQLi, XSS, active ZAP)"
+        required: true
+        default: false
+        type: boolean
+      enable_sqlmap:
+        description: "Enable SQLMap (aggressive — only on authorized targets)"
+        required: true
+        default: false
+        type: boolean
+      enable_dalfox:
+        description: "Enable Dalfox XSS scanning"
+        required: true
+        default: false
+        type: boolean
   schedule:
-    - cron: "0 2 * * *"
+    # كل يوم أحد الساعة 2 صباحاً
+    - cron: "0 2 * * 0"
 
 permissions:
   contents: read
 
+env:
+  # ============================================================
+  # CHANGE THIS — النطاق المستهدف
+  # ============================================================
+  TARGET: "platacard.mx"
+
+  # أمان افتراضي
+  ACTIVE_SCAN: "false"
+  ENABLE_SQLMAP: "false"
+  ENABLE_DALFOX: "false"
+
+  # حدود معدل الطلبات لتجنب الحظر
+  RATE_LIMIT: "10"
+  NUCLEI_RATE_LIMIT: "25"
+
 jobs:
-  recon:
+  security-assessment:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 240
 
     steps:
-      - name: Install dependencies
+
+      # ============================================================
+      # 1. تثبيت الاعتماديات الأساسية
+      # ============================================================
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y golang
+          sudo apt-get install -y \
+            git curl wget jq unzip \
+            python3 python3-pip python3-venv \
+            golang nodejs npm docker.io nmap \
+            libpcap-dev
 
+      # ============================================================
+      # 2. تثبيت أدوات ProjectDiscovery (الأساسية)
+      # ============================================================
+      - name: Install ProjectDiscovery tools
+        run: |
+          export PATH="$HOME/go/bin:$PATH"
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-
+          go install github.com/projectdiscovery/alterx/cmd/alterx@latest
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-      - name: Create directories
+      # ============================================================
+      # 3. تثبيت أدوات الاستطلاع الإضافية
+      # ============================================================
+      - name: Install additional recon tools
         run: |
-          mkdir -p results/{subdomains,dns,http,urls,js,nuclei}
+          export PATH="$HOME/go/bin:$PATH"
+          # أدوات URL
+          go install github.com/lc/gau/v2/cmd/gau@latest
+          go install github.com/tomnomnom/waybackurls@latest
+          # Fuzzing
+          go install github.com/ffuf/ffuf/v2@latest
+          # XSS
+          go install github.com/hahwul/dalfox/v2@latest
+          # Amass
+          go install github.com/owasp-amass/amass/v4/...@latest
+          # Gitleaks (اكتشاف الأسرار في Git)
+          go install github.com/gitleaks/gitleaks/v8@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
+      # ============================================================
+      # 4. تثبيت أدوات Python (JS Analysis + Secrets)
+      # ============================================================
+      - name: Install Python tools
+        run: |
+          python3 -m pip install --break-system-packages \
+            uro \
+            jsbeautifier
+
+          # LinkFinder — استخراج نقاط النهاية من JS
+          git clone --depth 1 https://github.com/GerbenJavado/LinkFinder.git /tmp/linkfinder
+          cd /tmp/linkfinder && python3 -m pip install --break-system-packages -r requirements.txt
+
+          # SecretFinder — اكتشاف الأسرار في JS
+          git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /tmp/secretfinder
+          cd /tmp/secretfinder && python3 -m pip install --break-system-packages -r requirements.txt
+
+      # ============================================================
+      # 5. تثبيت TruffleHog (اكتشاف الأسرار)
+      # ============================================================
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      # ============================================================
+      # 6. تثبيت Retire.js (اكتشاف إصدارات JS القديمة)
+      # ============================================================
+      - name: Install Retire.js
+        run: |
+          npm install -g retire
+
+      # ============================================================
+      # 7. تثبيت SQLMap
+      # ============================================================
+      - name: Install SQLMap
+        run: |
+          git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap
+          echo "SQLMAP_PATH=/opt/sqlmap/sqlmap.py" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # 8. تثبيت XSStrike (بديل لـ Dalfox)
+      # ============================================================
+      - name: Install XSStrike
+        run: |
+          git clone --depth 1 https://github.com/s0md3v/XSStrike.git /opt/xsstrike
+          cd /opt/xsstrike && python3 -m pip install --break-system-packages -r requirements.txt
+
+      # ============================================================
+      # 9. تحضير مساحة العمل
+      # ============================================================
+      - name: Prepare workspace
+        run: |
+          mkdir -p results/{subdomains,dns,http,ports,urls,js,js/files,params,secrets,nuclei,zap,sqlmap,xss,retire,linkfinder,secretfinder,trufflehog}
+
+      # ============================================================
+      # 10. التحقق من الهدف
+      # ============================================================
+      - name: Verify target
+        run: |
+          echo "Target: $TARGET"
+          if [[ "$TARGET" == *"/"* ]] || [[ "$TARGET" == *"://"* ]]; then
+            echo "ERROR: TARGET must be a hostname only (e.g., example.com)"
+            exit 1
+          fi
+          echo "$TARGET" > results/target.txt
+
+      # ============================================================
+      # 11. تعداد النطاقات الفرعية (Subfinder + Amass)
+      # ============================================================
       - name: Subdomain enumeration
         run: |
-          subfinder \
-            -d accellion.com / \
-            -silent \
-            -all \
-            -o results/subdomains/subdomains.txt
+          # Subfinder
+          subfinder -d "$TARGET" -silent -all -o results/subdomains/subfinder.txt || true
 
+          # Amass (passive only for safety)
+          timeout 300 amass enum -passive -d "$TARGET" -o results/subdomains/amass.txt || true
+
+          # دمج وإزالة التكرارات
+          cat results/subdomains/subfinder.txt results/subdomains/amass.txt 2>/dev/null \
+            | sort -u > results/subdomains/all.txt || true
+
+          echo "Total subdomains: $(wc -l < results/subdomains/all.txt)"
+
+      # ============================================================
+      # 12. حل DNS
+      # ============================================================
       - name: DNS resolution
         run: |
-          dnsx \
-            -l results/subdomains/subdomains.txt \
-            -silent \
-            -a \
-            -resp \
-            -o results/dns/resolved.txt
+          if [ -s results/subdomains/all.txt ]; then
+            dnsx -l results/subdomains/all.txt -silent -a -aaaa -cname -resp \
+              -o results/dns/dnsx.txt || true
+          fi
 
-      - name: HTTP probing
+      # ============================================================
+      # 13. اكتشاف HTTP / Hosts الحية
+      # ============================================================
+      - name: HTTP probing (httpx)
         run: |
-          httpx \
-            -l results/subdomains/subdomains.txt \
-            -silent \
-            -follow-redirects \
-            -status-code \
-            -title \
-            -tech-detect \
-            -web-server \
-            -content-length \
-            -o results/http/httpx.txt
+          httpx -l results/subdomains/all.txt \
+            -silent -follow-redirects \
+            -status-code -title -tech-detect -web-server \
+            -content-length -location \
+            -o results/http/httpx.txt || true
 
-      - name: Extract live URLs
+          if [ -s results/http/httpx.txt ]; then
+            awk '{print $1}' results/http/httpx.txt | sort -u > results/http/live.txt
+          fi
+
+      # ============================================================
+      # 14. فحص المنافذ (Naabu + Nmap)
+      # ============================================================
+      - name: Port scanning
         run: |
-          httpx \
-            -l results/subdomains/subdomains.txt \
-            -silent \
-            -follow-redirects \
-            -o results/http/live.txt
+          if [ -s results/subdomains/all.txt ]; then
+            # Naabu — فحص سريع للمنافذ الشائعة
+            naabu -list results/subdomains/all.txt -top-ports 100 \
+              -rate "$RATE_LIMIT" -silent -o results/ports/naabu.txt || true
+
+            # Nmap — فحص أعمق للمنافذ المفتوحة
+            if [ -s results/ports/naabu.txt ]; then
+              awk -F: '{print $1}' results/ports/naabu.txt | sort -u > results/ports/ips.txt
+              nmap -sV -sC --top-ports 50 -iL results/ports/ips.txt \
+                -oN results/ports/nmap.txt --min-rate 100 || true
+            fi
+          fi
+
+      # ============================================================
+      # 15. جمع عناوين URL التاريخية (GAU + Wayback)
+      # ============================================================
+      - name: Historical URL collection
+        run: |
+          if [ -s results/subdomains/all.txt ]; then
+            # GAU
+            cat results/subdomains/all.txt | gau --threads 5 > results/urls/gau.txt || true
+            # Wayback
+            cat results/subdomains/all.txt | waybackurls > results/urls/wayback.txt || true
+          fi
+
+      # ============================================================
+      # 16. الزحف (Katana + FFUF)
+      # ============================================================
+      - name: Crawling (Katana)
+        run: |
+          if [ -s results/http/live.txt ]; then
+            katana -list results/http/live.txt -silent -d 3 -jc -kf all \
+              -o results/urls/katana.txt || true
+          fi
+
+      - name: Directory fuzzing (ffuf)
+        if: ${{ github.event.inputs.active_scan == 'true' }}
+        run: |
+          if [ -s results/http/live.txt ]; then
+            # قائمة كلمات صغيرة للاختبار السريع
+            cat > /tmp/wordlist.txt << 'EOF'
+          admin
+          api
+          backup
+          config
+          dashboard
+          debug
+          .env
+          .git
+          login
+          robots.txt
+          sitemap.xml
+          swagger
+          test
+          uploads
+          wp-admin
+          EOF
+            while read -r host; do
+              ffuf -u "$host/FUZZ" -w /tmp/wordlist.txt -mc 200,301,302,403 \
+                -of csv -o "results/urls/ffuf_$(echo $host | md5sum | cut -c1-8).csv" \
+                -s 2>/dev/null || true
+            done < results/http/live.txt
+          fi
+
+      # ============================================================
+      # 17. دمج وتنقية عناوين URL
+      # ============================================================
+      - name: Merge URLs
+        run: |
+          touch results/urls/gau.txt results/urls/wayback.txt results/urls/katana.txt
+          cat results/urls/gau.txt results/urls/wayback.txt results/urls/katana.txt \
+            | sort -u > results/urls/all-raw.txt
+          cat results/urls/all-raw.txt | uro > results/urls/all.txt \
+            || cp results/urls/all-raw.txt results/urls/all.txt
+
+      # ============================================================
+      # 18. استخراج المعاملات (Parameters)
+      # ============================================================
+      - name: Extract parameters
+        run: |
+          grep '?' results/urls/all.txt | sort -u > results/params/parameterized.txt || true
+          grep -Eoi '(url|uri|redirect|next|return|callback|file|path|page|id|query|search|q|cmd|exec|template|load|src|dest)' \
+            results/params/parameterized.txt | sort -u > results/params/interesting.txt || true
+
+      # ============================================================
+      # 19. استخراج وتحميل ملفات JavaScript
+      # ============================================================
+      - name: Extract JavaScript URLs
+        run: |
+          grep -Ei '\.js([?#].*)?$' results/urls/all.txt | sort -u > results/js/javascript.txt || true
+
+      - name: Download JavaScript files
+        run: |
+          if [ -s results/js/javascript.txt ]; then
+            while read -r url; do
+              hash=$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)
+              curl -Lks --max-time 20 --retry 1 "$url" \
+                -o "results/js/files/$hash.js" || true
+            done < results/js/javascript.txt
+          fi
+
+      # ============================================================
+      # 20. تحليل JS: LinkFinder (نقاط النهاية)
+      # ============================================================
+      - name: LinkFinder — extract endpoints
+        run: |
+          if [ -d results/js/files ] && [ "$(ls -A results/js/files 2>/dev/null)" ]; then
+            for f in results/js/files/*.js; do
+              [ -s "$f" ] || continue
+              python3 /tmp/linkfinder/linkfinder.py -i "$f" -o cli \
+                2>/dev/null >> results/linkfinder/endpoints.txt || true
+            done
+            sort -u results/linkfinder/endpoints.txt -o results/linkfinder/endpoints.txt 2>/dev/null || true
+          fi
+
+      # ============================================================
+      # 21. تحليل JS: SecretFinder (الأسرار)
+      # ============================================================
+      - name: SecretFinder — find secrets
+        run: |
+          if [ -d results/js/files ] && [ "$(ls -A results/js/files 2>/dev/null)" ]; then
+            for f in results/js/files/*.js; do
+              [ -s "$f" ] || continue
+              python3 /tmp/secretfinder/SecretFinder.py -i "$f" -o cli \
+                2>/dev/null >> results/secretfinder/secrets.txt || true
+            done
+            sort -u results/secretfinder/secrets.txt -o results/secretfinder/secrets.txt 2>/dev/null || true
+          fi
+
+      # ============================================================
+      # 22. تحليل JS: البحث عن أنماط الأسرار (grep + TruffleHog)
+      # ============================================================
+      - name: Grep secrets in JS
+        run: |
+          grep -RniE \
+            'api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|authorization|bearer|password|private[_-]?key|aws_access|firebase|graphql|websocket|internal[_-]?api' \
+            results/js/files > results/secrets/js-interesting.txt 2>/dev/null || true
+
+      - name: TruffleHog — scan JS files
+        run: |
+          if [ -d results/js/files ] && [ "$(ls -A results/js/files 2>/dev/null)" ]; then
+            trufflehog filesystem results/js/files --json \
+              > results/trufflehog/findings.json 2>/dev/null || true
+          fi
+
+      # ============================================================
+      # 23. Retire.js — اكتشاف إصدارات JS القديمة
+      # ============================================================
+      - name: Retire.js — outdated JS libraries
+        run: |
+          if [ -d results/js/files ] && [ "$(ls -A results/js/files 2>/dev/null)" ]; then
+            retire --path results/js/files --outputformat json \
+              --outputpath results/retire/retire.json --exitwith 0 || true
+            retire --path results/js/files --outputformat text \
+              --outputpath results/retire/retire.txt --exitwith 0 || true
+          fi
+
+      # ============================================================
+      # 24. JS Miner — تحليل إضافي (عبر الأنماط)
+      # ============================================================
+      - name: JS Miner-like analysis
+        run: |
+          # محاكاة JS Miner: البحث عن cloud URLs, endpoints, source maps
+          grep -RniE \
+            '(s3\.|storage\.googleapis|blob\.core\.windows|firebaseio|amazonaws|cloudfront|herokuapp|azurewebsites|digitaloceanspaces)' \
+            results/js/files > results/secrets/cloud-urls.txt 2>/dev/null || true
+
+          grep -RniE 'sourceMappingURL=' results/js/files \
+            > results/js/sourcemaps.txt 2>/dev/null || true
+
+      # ============================================================
+      # 25. Nuclei — فحص شامل بالقالب
+      # ============================================================
+      - name: Update Nuclei templates
+        run: nuclei -update-templates -silent || true
 
       - name: Nuclei scan
         run: |
-          nuclei \
-            -l results/http/live.txt \
-            -severity info,low,medium,high,critical \
-            -o results/nuclei/nuclei.txt
+          if [ -s results/http/live.txt ]; then
+            nuclei -l results/http/live.txt \
+              -severity info,low,medium,high,critical \
+              -exclude-tags dos,fuzz \
+              -rate-limit "$NUCLEI_RATE_LIMIT" \
+              -bulk-size 10 -c 5 \
+              -o results/nuclei/nuclei.txt || true
+          fi
 
-      - name: Save results
+      # ============================================================
+      # 26. SQLMap — فحص SQL Injection
+      # ============================================================
+      - name: SQLMap scan
+        if: ${{ github.event.inputs.enable_sqlmap == 'true' }}
+        run: |
+          if [ -s results/params/parameterized.txt ]; then
+            # أخذ أول 10 روابط فقط لتجنب الإفراط
+            head -10 results/params/parameterized.txt > /tmp/sqlmap_targets.txt
+            while read -r url; do
+              python3 "$SQLMAP_PATH" -u "$url" \
+                --batch --level=1 --risk=1 \
+                --output-dir=results/sqlmap \
+                --timeout=10 --retries=1 \
+                --threads=2 --random-agent \
+                --flush-session 2>/dev/null || true
+            done < /tmp/sqlmap_targets.txt
+          fi
+
+      # ============================================================
+      # 27. Dalfox — فحص XSS
+      # ============================================================
+      - name: Dalfox XSS scan
+        if: ${{ github.event.inputs.enable_dalfox == 'true' }}
+        run: |
+          if [ -s results/params/parameterized.txt ]; then
+            head -20 results/params/parameterized.txt > /tmp/xss_targets.txt
+            dalfox file /tmp/xss_targets.txt \
+              --silence --no-color \
+              --output results/xss/dalfox.txt \
+              --rate-limit "$RATE_LIMIT" \
+              --timeout 10 --worker 2 2>/dev/null || true
+          fi
+
+      # ============================================================
+      # 28. XSStrike — فحص XSS بديل
+      # ============================================================
+      - name: XSStrike XSS scan
+        if: ${{ github.event.inputs.enable_dalfox == 'true' }}
+        run: |
+          if [ -s results/params/parameterized.txt ]; then
+            head -5 results/params/parameterized.txt > /tmp/xsstrike_targets.txt
+            while read -r url; do
+              timeout 30 python3 /opt/xsstrike/xsstrike.py -u "$url" --skip-dom \
+                2>/dev/null >> results/xss/xsstrike.txt || true
+            done < /tmp/xsstrike_targets.txt
+          fi
+
+      # ============================================================
+      # 29. OWASP ZAP Baseline
+      # ============================================================
+      - name: OWASP ZAP baseline
+        run: |
+          docker run --rm \
+            -v "$PWD/results/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t "https://$TARGET" \
+            -r zap-baseline.html \
+            -J zap-baseline.json \
+            -w zap-baseline.md \
+            -m 10 || true
+
+      # ============================================================
+      # 30. OWASP ZAP Active Scan (اختياري)
+      # ============================================================
+      - name: OWASP ZAP active scan
+        if: ${{ github.event.inputs.active_scan == 'true' }}
+        run: |
+          docker run --rm \
+            -v "$PWD/results/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t "https://$TARGET" \
+            -r zap-full.html \
+            -J zap-full.json \
+            -w zap-full.md \
+            -m 30 || true
+
+      # ============================================================
+      # 31. الملخص
+      # ============================================================
+      - name: Create summary
+        run: |
+          {
+            echo "# 🛡️ Security Assessment Report"
+            echo ""
+            echo "**Target:** \`$TARGET\`"
+            echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo "## 📊 Counts"
+            echo ""
+            echo "| Category | Count |"
+            echo "|---|---:|"
+
+            printf "| Subdomains | %s |\n" "$(wc -l < results/subdomains/all.txt 2>/dev/null || echo 0)"
+            printf "| Live hosts | %s |\n" "$(wc -l < results/http/live.txt 2>/dev/null || echo 0)"
+            printf "| Open ports (Naabu) | %s |\n" "$(wc -l < results/ports/naabu.txt 2>/dev/null || echo 0)"
+            printf "| URLs (all) | %s |\n" "$(wc -l < results/urls/all.txt 2>/dev/null || echo 0)"
+            printf "| Parameterized URLs | %s |\n" "$(wc -l < results/params/parameterized.txt 2>/dev/null || echo 0)"
+            printf "| JavaScript files | %s |\n" "$(wc -l < results/js/javascript.txt 2>/dev/null || echo 0)"
+            printf "| JS endpoints (LinkFinder) | %s |\n" "$(wc -l < results/linkfinder/endpoints.txt 2>/dev/null || echo 0)"
+            printf "| JS secrets (SecretFinder) | %s |\n" "$(wc -l < results/secretfinder/secrets.txt 2>/dev/null || echo 0)"
+            printf "| TruffleHog findings | %s |\n" "$(wc -l < results/trufflehog/findings.json 2>/dev/null || echo 0)"
+            printf "| Retire.js findings | %s |\n" "$(wc -l < results/retire/retire.txt 2>/dev/null || echo 0)"
+            printf "| Nuclei findings | %s |\n" "$(wc -l < results/nuclei/nuclei.txt 2>/dev/null || echo 0)"
+            printf "| SQLMap findings | %s |\n" "$(find results/sqlmap -name '*.csv' 2>/dev/null | wc -l || echo 0)"
+            printf "| Dalfox XSS | %s |\n" "$(wc -l < results/xss/dalfox.txt 2>/dev/null || echo 0)"
+            printf "| XSStrike XSS | %s |\n" "$(wc -l < results/xss/xsstrike.txt 2>/dev/null || echo 0)"
+            echo ""
+            echo "## 🔍 Key Files"
+            echo ""
+            echo "- \`results/nuclei/nuclei.txt\` — Nuclei findings"
+            echo "- \`results/secretfinder/secrets.txt\` — JS secrets"
+            echo "- \`results/trufflehog/findings.json\` — TruffleHog results"
+            echo "- \`results/retire/retire.txt\` — Outdated JS libraries"
+            echo "- \`results/xss/dalfox.txt\` — XSS findings"
+            echo "- \`results/sqlmap/\` — SQLMap output"
+            echo ""
+            echo "## ⚠️ Important"
+            echo ""
+            echo "Automated findings require **manual validation** before reporting."
+          } > results/SUMMARY.md
+
+      # ============================================================
+      # 32. رفع النتائج
+      # ============================================================
+      - name: Upload complete results
         uses: actions/upload-artifact@v4
         with:
-          name: recon-results
+          name: full-security-assessment
           path: results/
+          retention-days: 14
