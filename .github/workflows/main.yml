@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 env:
-  TARGET: "platacard.mx"
+  TARGET: "patreon.com"
   ACTIVE_SCAN: "false"
   ENABLE_SQLMAP: "true"
   ENABLE_DALFOX: "false"
