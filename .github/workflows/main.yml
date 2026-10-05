@@ -1,365 +1,1388 @@
-name: Full Security Assessment (Parallel)
+name: Professional Security Assessment
 
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: "Authorized target URL"
+        required: true
+        type: string
+        default: "https://example.com"
+
       active_scan:
         description: "Enable active security testing"
         required: true
-        default: false
         type: boolean
+        default: false
+
       enable_sqlmap:
-        description: "Enable SQLMap"
+        description: "Enable limited SQL injection testing"
         required: true
-        default: false
         type: boolean
-      enable_dalfox:
-        description: "Enable Dalfox XSS scanning"
+        default: false
+
+      enable_xss:
+        description: "Enable active XSS testing"
         required: true
-        default: false
         type: boolean
+        default: false
+
+      enable_zap_active:
+        description: "Enable OWASP ZAP active scan"
+        required: true
+        type: boolean
+        default: false
+
+      max_urls:
+        description: "Maximum URLs for active testing"
+        required: true
+        type: string
+        default: "50"
+
   schedule:
     - cron: "0 2 * * 0"
+
 
 permissions:
   contents: read
 
+
+concurrency:
+  group: security-assessment
+  cancel-in-progress: false
+
+
 env:
-  TARGET: "https://www.nn-group.com/"
-  ACTIVE_SCAN: "false"
-  ENABLE_SQLMAP: "true"
-  ENABLE_DALFOX: "false"
+  # Used for scheduled executions.
+  # Change this to an authorized target.
+  TARGET: "https://example.com"
+
   RATE_LIMIT: "10"
+  HTTP_RATE_LIMIT: "25"
   NUCLEI_RATE_LIMIT: "25"
 
+  MAX_URLS: "50"
+  MAX_JS_FILES: "200"
+
+  GO_VERSION: "1.25"
+
+  # Safe defaults.
+  ACTIVE_SCAN: "false"
+  ENABLE_SQLMAP: "false"
+  ENABLE_XSS: "false"
+  ENABLE_ZAP_ACTIVE: "false"
+
+  RESULTS_DIR: "results"
+
+
+defaults:
+  run:
+    shell: bash
+
+
+# ============================================================
+# 0. INITIALIZATION
+# ============================================================
 jobs:
 
-  # ============================================================
-  # المرحلة 1: تعداد النطاقات الفرعية (يعمل بالتوازي)
-  # ============================================================
+  initialize:
+    name: Initialize Assessment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    outputs:
+      target: ${{ steps.config.outputs.target }}
+      host: ${{ steps.config.outputs.host }}
+      active_scan: ${{ steps.config.outputs.active_scan }}
+      sqlmap: ${{ steps.config.outputs.sqlmap }}
+      xss: ${{ steps.config.outputs.xss }}
+      zap_active: ${{ steps.config.outputs.zap_active }}
+      max_urls: ${{ steps.config.outputs.max_urls }}
+
+    steps:
+
+      - name: Resolve configuration
+        id: config
+        env:
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+          INPUT_ACTIVE: ${{ github.event.inputs.active_scan }}
+          INPUT_SQLMAP: ${{ github.event.inputs.enable_sqlmap }}
+          INPUT_XSS: ${{ github.event.inputs.enable_xss }}
+          INPUT_ZAP: ${{ github.event.inputs.enable_zap_active }}
+          INPUT_MAX_URLS: ${{ github.event.inputs.max_urls }}
+
+        run: |
+          set -euo pipefail
+
+          # Manual workflow uses the supplied target.
+          # Scheduled workflow falls back to env.TARGET.
+          TARGET_VALUE="${INPUT_TARGET:-$TARGET}"
+
+          TARGET_VALUE="${TARGET_VALUE%/}"
+
+          if [[ ! "$TARGET_VALUE" =~ ^https?:// ]]; then
+            echo "ERROR: Target must start with http:// or https://"
+            exit 1
+          fi
+
+          HOST="$(
+            TARGET_VALUE="$TARGET_VALUE" python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+
+          target = os.environ["TARGET_VALUE"]
+          parsed = urlparse(target)
+
+          if not parsed.hostname:
+              raise SystemExit("Invalid target hostname")
+
+          print(parsed.hostname)
+          PY
+          )"
+
+          ACTIVE="${INPUT_ACTIVE:-false}"
+          SQLMAP="${INPUT_SQLMAP:-false}"
+          XSS="${INPUT_XSS:-false}"
+          ZAP="${INPUT_ZAP:-false}"
+          MAX_URLS_VALUE="${INPUT_MAX_URLS:-$MAX_URLS}"
+
+          if ! [[ "$MAX_URLS_VALUE" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: max_urls must be numeric"
+            exit 1
+          fi
+
+          if [[ "$MAX_URLS_VALUE" -lt 1 ]]; then
+            echo "ERROR: max_urls must be greater than 0"
+            exit 1
+          fi
+
+          # Never allow individual active scanners without
+          # explicitly enabling the global active-scan switch.
+          if [[ "$ACTIVE" != "true" ]]; then
+            SQLMAP="false"
+            XSS="false"
+            ZAP="false"
+          fi
+
+          {
+            echo "target=$TARGET_VALUE"
+            echo "host=$HOST"
+            echo "active_scan=$ACTIVE"
+            echo "sqlmap=$SQLMAP"
+            echo "xss=$XSS"
+            echo "zap_active=$ZAP"
+            echo "max_urls=$MAX_URLS_VALUE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configuration summary
+        run: |
+          echo "======================================"
+          echo "Security Assessment Configuration"
+          echo "======================================"
+          echo "Target:     ${{ steps.config.outputs.target }}"
+          echo "Host:       ${{ steps.config.outputs.host }}"
+          echo "Active:     ${{ steps.config.outputs.active_scan }}"
+          echo "SQLMap:     ${{ steps.config.outputs.sqlmap }}"
+          echo "XSS:        ${{ steps.config.outputs.xss }}"
+          echo "ZAP Active: ${{ steps.config.outputs.zap_active }}"
+          echo "Max URLs:   ${{ steps.config.outputs.max_urls }}"
+          echo "======================================"
+
+
+# ============================================================
+# 1. SUBDOMAIN + DNS DISCOVERY
+# ============================================================
+
   subdomain-enumeration:
+    name: Subdomain & DNS Discovery
+    needs: initialize
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
+
       - uses: actions/checkout@v4
+
       - name: Setup Go
         uses: actions/setup-go@v5
-        with: { go-version: '1.25', check-latest: true }
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
       - name: Install tools
         run: |
-          sudo apt-get update && sudo apt-get install -y dnsutils python3-pip
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            dnsutils \
+            jq \
+            python3-pip
+
           pip install --break-system-packages dnsgen
+
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/alterx/cmd/alterx@latest
           go install github.com/tomnomnom/assetfinder@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-      - name: Run Subdomain Enumeration
+
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Passive enumeration
+        env:
+          HOST: ${{ needs.initialize.outputs.host }}
+
         run: |
-          export PATH="$HOME/go/bin:$PATH"
-          mkdir -p results/subdomains
-          subfinder -d "$TARGET" -silent -all -o results/subdomains/subfinder.txt || true
-          assetfinder --subs-only "$TARGET" > results/subdomains/assetfinder.txt || true
-          cat results/subdomains/*.txt 2>/dev/null | sort -u > results/subdomains/all-raw.txt
-          cat results/subdomains/all-raw.txt | dnsgen - > results/subdomains/dnsgen.txt || true
-          cat results/subdomains/all-raw.txt | alterx -silent > results/subdomains/alterx.txt || true
-          cat results/subdomains/dnsgen.txt results/subdomains/alterx.txt | sort -u >> results/subdomains/all-raw.txt
-          dnsx -l results/subdomains/all-raw.txt -silent -a -resp 2>/dev/null | awk '{print $1}' | sort -u > results/subdomains/all.txt || true
-          echo "Resolved: $(wc -l < results/subdomains/all.txt)"
-      - name: Upload Subdomains
+          set -euo pipefail
+
+          mkdir -p "$RESULTS_DIR/subdomains"
+
+          subfinder \
+            -d "$HOST" \
+            -silent \
+            -all \
+            -o "$RESULTS_DIR/subdomains/subfinder.txt" \
+            || true
+
+          assetfinder \
+            --subs-only "$HOST" \
+            > "$RESULTS_DIR/subdomains/assetfinder.txt" \
+            || true
+
+          cat "$RESULTS_DIR"/subdomains/*.txt 2>/dev/null \
+            | sed 's/\r//g' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | grep -E '^[A-Za-z0-9._-]+\.[A-Za-z]{2,}$' \
+            | sort -u \
+            > "$RESULTS_DIR/subdomains/passive.txt" \
+            || true
+
+      - name: Generate DNS candidates
+        run: |
+          set -euo pipefail
+
+          touch \
+            "$RESULTS_DIR/subdomains/dnsgen.txt" \
+            "$RESULTS_DIR/subdomains/alterx.txt"
+
+          if [[ -s "$RESULTS_DIR/subdomains/passive.txt" ]]; then
+
+            dnsgen \
+              "$RESULTS_DIR/subdomains/passive.txt" \
+              > "$RESULTS_DIR/subdomains/dnsgen.txt" \
+              || true
+
+            alterx \
+              -l "$RESULTS_DIR/subdomains/passive.txt" \
+              -silent \
+              > "$RESULTS_DIR/subdomains/alterx.txt" \
+              || true
+          fi
+
+          cat \
+            "$RESULTS_DIR/subdomains/passive.txt" \
+            "$RESULTS_DIR/subdomains/dnsgen.txt" \
+            "$RESULTS_DIR/subdomains/alterx.txt" \
+            2>/dev/null \
+            | sort -u \
+            > "$RESULTS_DIR/subdomains/candidates.txt" \
+            || true
+
+      - name: Resolve DNS
+        run: |
+          set -euo pipefail
+
+          if [[ -s "$RESULTS_DIR/subdomains/candidates.txt" ]]; then
+
+            dnsx \
+              -l "$RESULTS_DIR/subdomains/candidates.txt" \
+              -silent \
+              -a \
+              -resp \
+              > "$RESULTS_DIR/subdomains/dns-resolved.txt" \
+              || true
+
+            awk '{print $1}' \
+              "$RESULTS_DIR/subdomains/dns-resolved.txt" \
+              | sort -u \
+              > "$RESULTS_DIR/subdomains/all.txt"
+
+          else
+            touch "$RESULTS_DIR/subdomains/all.txt"
+          fi
+
+          echo "Resolved subdomains:"
+          wc -l "$RESULTS_DIR/subdomains/all.txt"
+
+      - name: Upload subdomain results
         uses: actions/upload-artifact@v4
         with:
           name: subdomains
           path: results/subdomains/
+          retention-days: 14
 
-  # ============================================================
-  # المرحلة 1: فحص المنافذ (يعمل بالتوازي مع تعداد النطاقات)
-  # ============================================================
+
+# ============================================================
+# 2. HTTP DISCOVERY
+# ============================================================
+
+  http-discovery:
+    name: HTTP Discovery & Fingerprinting
+    needs: subdomain-enumeration
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: subdomains
+          path: results/subdomains/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install httpx
+        run: |
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Probe HTTP services
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RESULTS_DIR/http"
+
+          if [[ ! -s "$RESULTS_DIR/subdomains/all.txt" ]]; then
+            touch "$RESULTS_DIR/http/live.txt"
+            touch "$RESULTS_DIR/http/httpx.json"
+            exit 0
+          fi
+
+          httpx \
+            -l "$RESULTS_DIR/subdomains/all.txt" \
+            -silent \
+            -follow-redirects \
+            -status-code \
+            -title \
+            -tech-detect \
+            -web-server \
+            -content-length \
+            -location \
+            -json \
+            -rate-limit "$HTTP_RATE_LIMIT" \
+            -o "$RESULTS_DIR/http/httpx.json" \
+            || true
+
+          jq -r '.url // empty' \
+            "$RESULTS_DIR/http/httpx.json" \
+            | sort -u \
+            > "$RESULTS_DIR/http/live.txt" \
+            || true
+
+          echo "Live hosts:"
+          wc -l "$RESULTS_DIR/http/live.txt"
+
+      - name: Upload HTTP results
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-discovery
+          path: results/http/
+          retention-days: 14
+
+
+# ============================================================
+# 3. PORT / SERVICE DISCOVERY
+# ============================================================
+
   port-scanning:
+    name: Port & Service Discovery
     needs: subdomain-enumeration
     runs-on: ubuntu-latest
     timeout-minutes: 180
+
     steps:
+
       - uses: actions/checkout@v4
-      - name: Download Subdomains
-        uses: actions/download-artifact@v4
-        with: { name: subdomains, path: results/subdomains/ }
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with: { go-version: '1.25' }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: subdomains
+          path: results/subdomains/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
       - name: Install tools
         run: |
-          sudo apt-get update && sudo apt-get install -y nmap
-          go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-      - name: Run Port Scan
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          mkdir -p results/ports
-          if [ -s results/subdomains/all.txt ]; then
-            naabu -list results/subdomains/all.txt -top-ports 100 -rate "$RATE_LIMIT" -silent -o results/ports/naabu.txt || true
-            if [ -s results/ports/naabu.txt ]; then
-              awk -F: '{print $1}' results/ports/naabu.txt | sort -u > results/ports/ips.txt
-              nmap -sV --top-ports 30 -iL results/ports/ips.txt -oN results/ports/nmap.txt --min-rate 100 2>/dev/null || true
-            fi
-          fi
-      - name: Upload Ports
-        uses: actions/upload-artifact@v4
-        with: { name: ports, path: results/ports/ }
+          sudo apt-get update
+          sudo apt-get install -y nmap
 
-  # ============================================================
-  # المرحلة 2: جمع الروابط والزحف (يعمل بالتوازي مع Nuclei)
-  # ============================================================
-  url-crawling:
-    needs: subdomain-enumeration
+          go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Naabu scan
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RESULTS_DIR/ports"
+
+          if [[ ! -s "$RESULTS_DIR/subdomains/all.txt" ]]; then
+            touch "$RESULTS_DIR/ports/naabu.txt"
+            exit 0
+          fi
+
+          naabu \
+            -list "$RESULTS_DIR/subdomains/all.txt" \
+            -top-ports 100 \
+            -rate "$RATE_LIMIT" \
+            -silent \
+            -o "$RESULTS_DIR/ports/naabu.txt" \
+            || true
+
+      - name: Nmap service detection
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$RESULTS_DIR/ports/naabu.txt" ]]; then
+            exit 0
+          fi
+
+          cut -d: -f1 \
+            "$RESULTS_DIR/ports/naabu.txt" \
+            | sort -u \
+            > "$RESULTS_DIR/ports/hosts.txt"
+
+          nmap \
+            -sV \
+            --top-ports 30 \
+            -iL "$RESULTS_DIR/ports/hosts.txt" \
+            --min-rate 50 \
+            -oN "$RESULTS_DIR/ports/nmap.txt" \
+            || true
+
+      - name: Upload port results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ports
+          path: results/ports/
+          retention-days: 14
+
+
+# ============================================================
+# 4. URL / ENDPOINT DISCOVERY
+# ============================================================
+
+  url-discovery:
+    name: URL & Endpoint Discovery
+    needs: http-discovery
     runs-on: ubuntu-latest
     timeout-minutes: 240
+
     steps:
+
       - uses: actions/checkout@v4
-      - name: Download Subdomains
-        uses: actions/download-artifact@v4
-        with: { name: subdomains, path: results/subdomains/ }
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with: { go-version: '1.25' }
-      - name: Install tools
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: subdomains
+          path: results/subdomains/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: http-discovery
+          path: results/http/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install URL tools
         run: |
+          set -euo pipefail
+
           pip install --break-system-packages uro
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+
           go install github.com/projectdiscovery/katana/cmd/katana@latest
           go install github.com/lc/gau/v2/cmd/gau@latest
           go install github.com/tomnomnom/waybackurls@latest
           go install github.com/jaeles-project/gospider@latest
-          go install github.com/hakluke/hakrawler@latest
           go install github.com/tomnomnom/unfurl@latest
-          go install github.com/tomnomnom/qsreplace@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-      - name: Run URL Crawling
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          mkdir -p results/{http,urls,gospider,params,gf}
-          httpx -l results/subdomains/all.txt -silent -follow-redirects -status-code -title -tech-detect -o results/http/httpx.txt || true
-          awk '{print $1}' results/http/httpx.txt | sort -u > results/http/live.txt
-          cat results/subdomains/all.txt | gau --threads 5 > results/urls/gau.txt || true
-          cat results/subdomains/all.txt | waybackurls > results/urls/wayback.txt || true
-          katana -list results/http/live.txt -silent -d 3 -jc -kf all -aff -o results/urls/katana.txt || true
-          gospider -S results/http/live.txt -c 10 -d 3 -t 20 --sitemap --robots --other-source --include-subs -o results/gospider/ 2>/dev/null || true
-          find results/gospider -name '*.txt' -exec cat {} \; 2>/dev/null | grep -oE 'https?://[^ ]+' | sort -u > results/urls/gospider.txt || true
-          cat results/urls/gau.txt results/urls/wayback.txt results/urls/katana.txt results/urls/gospider.txt 2>/dev/null | sort -u > results/urls/all-raw.txt
-          cat results/urls/all-raw.txt | uro > results/urls/all.txt || cp results/urls/all-raw.txt results/urls/all.txt
-          grep '?' results/urls/all.txt | sort -u > results/params/parameterized.txt || true
-          cat results/params/parameterized.txt | unfurl -u keys 2>/dev/null | tr ',' '\n' | sort -u > results/params/unique-keys.txt || true
-      - name: Upload URLs & Params
-        uses: actions/upload-artifact@v4
-        with: { name: urls, path: results/urls/ }
-      - name: Upload Params
-        uses: actions/upload-artifact@v4
-        with: { name: params, path: results/params/ }
-      - name: Upload Live Hosts
-        uses: actions/upload-artifact@v4
-        with: { name: live-hosts, path: results/http/live.txt }
 
-  # ============================================================
-  # المرحلة 2: فحص Nuclei (يعمل بالتوازي مع جمع الروابط)
-  # ============================================================
-  nuclei-scan:
-    needs: subdomain-enumeration
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download Subdomains
-        uses: actions/download-artifact@v4
-        with: { name: subdomains, path: results/subdomains/ }
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with: { go-version: '1.25' }
-      - name: Install tools
-        run: |
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-      - name: Run Nuclei
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          mkdir -p results/{http,nuclei}
-          httpx -l results/subdomains/all.txt -silent -follow-redirects -o results/http/httpx.txt || true
-          awk '{print $1}' results/http/httpx.txt | sort -u > results/http/live.txt
-          if [ -s results/http/live.txt ]; then
-            nuclei -l results/http/live.txt -severity info,low,medium,high,critical -exclude-tags dos,fuzz -rate-limit "$NUCLEI_RATE_LIMIT" -bulk-size 10 -c 5 -o results/nuclei/nuclei.txt || true
-          fi
-      - name: Upload Nuclei Results
-        uses: actions/upload-artifact@v4
-        with: { name: nuclei-results, path: results/nuclei/ }
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
-  # ============================================================
-  # المرحلة 3: فحص الأسرار و JS (يعمل بالتوازي مع XSS/SQLMap)
-  # ============================================================
-  secrets-scan:
-    needs: url-crawling
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download URLs
-        uses: actions/download-artifact@v4
-        with: { name: urls, path: results/urls/ }
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with: { go-version: '1.25' }
-      - name: Install tools
+      - name: Collect URLs
         run: |
-          npm install -g retire
-          pip install --break-system-packages jsbeautifier
-          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
-          go install github.com/lc/subjs@latest
-          go install github.com/003random/getJS@latest
-          go install github.com/tomnomnom/gf@latest
-          go install github.com/tomnomnom/anew@latest
-          # استخدام المسار الصحيح لـ jsubfinder
-          go install github.com/ThreatUnkown/jsubfinder@latest
-          git clone --depth 1 https://github.com/GerbenJavado/LinkFinder.git /tmp/linkfinder
-          cd /tmp/linkfinder && pip install --break-system-packages -r requirements.txt
-          git clone --depth 1 https://github.com/m4ll0k/SecretFinder.git /tmp/secretfinder
-          cd /tmp/secretfinder && pip install --break-system-packages -r requirements.txt
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-      - name: Run Secrets Scan
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          mkdir -p results/{js,js/files,secrets,retire,trufflehog,linkfinder,secretfinder,jsubfinder}
-          grep -Ei '\.js([?#].*)?$' results/urls/all.txt | sort -u > results/js/javascript.txt || true
-          if [ -s results/js/javascript.txt ]; then
-            while read -r url; do
-              hash=$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)
-              curl -Lks --max-time 20 -A "Mozilla/5.0" "$url" -o "results/js/files/$hash.js" || true
-            done < results/js/javascript.txt
-          fi
-          # LinkFinder
-          for f in results/js/files/*.js; do
-            [ -s "$f" ] || continue
-            python3 /tmp/linkfinder/linkfinder.py -i "$f" -o cli 2>/dev/null >> results/linkfinder/endpoints.txt || true
-          done
-          # SecretFinder
-          for f in results/js/files/*.js; do
-            [ -s "$f" ] || continue
-            python3 /tmp/secretfinder/SecretFinder.py -i "$f" -o cli 2>/dev/null >> results/secretfinder/secrets.txt || true
-          done
-          # JSubFinder
-          jsubfinder scan results/js/files -s -o results/jsubfinder/subs.txt 2>/dev/null || true
-          # Grep Secrets
-          grep -RniE 'api[_-]?key|secret|password|token|bearer|aws_access' results/js/files > results/secrets/js-interesting.txt 2>/dev/null || true
-          # TruffleHog
-          trufflehog filesystem results/js/files --json > results/trufflehog/findings.json 2>/dev/null || true
-          # Retire.js
-          retire --path results/js/files --outputformat json --outputpath results/retire/retire.json --exitwith 0 || true
-      - name: Upload Secrets Results
-        uses: actions/upload-artifact@v4
-        with: { name: secrets-results, path: results/ }
+          set -euo pipefail
 
-  # ============================================================
-  # المرحلة 3: فحص XSS و SQLMap (يعمل بالتوازي مع فحص الأسرار)
-  # ============================================================
-  xss-sqlmap-scan:
-    needs: url-crawling
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download Params & URLs
-        uses: actions/download-artifact@v4
-        with: { name: params, path: results/params/ }
-      - uses: actions/download-artifact@v4
-        with: { name: urls, path: results/urls/ }
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with: { go-version: '1.25' }
-      - name: Install tools
-        run: |
-          sudo apt-get install -y python3-pip
-          pip install --break-system-packages arjun
-          go install github.com/hahwul/dalfox/v2@latest
-          go install github.com/Emoe/kxss@latest
-          go install github.com/ffuf/ffuf/v2@latest
-          git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap
-          git clone --depth 1 https://github.com/s0md3v/XSStrike.git /opt/xsstrike
-          cd /opt/xsstrike && pip install --break-system-packages -r requirements.txt
-          git clone --depth 1 https://github.com/s0md3v/Corsy.git /opt/corsy
-          cd /opt/corsy && pip install --break-system-packages -r requirements.txt
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-          echo "SQLMAP_PATH=/opt/sqlmap/sqlmap.py" >> $GITHUB_ENV
-      - name: Run XSS & SQLMap
-        run: |
-          export PATH="$HOME/go/bin:$PATH"
-          mkdir -p results/{xss,sqlmap,arjun,kxss,corsy}
-          # Kxss
-          if [ -s results/params/parameterized.txt ]; then
-            head -100 results/params/parameterized.txt | qsreplace 'AaAaAa' | kxss > results/kxss/reflected.txt || true
-          fi
-          # Dalfox
-          if [ -s results/params/parameterized.txt ]; then
-            head -30 results/params/parameterized.txt | dalfox pipe --silence --no-color --rate-limit "$RATE_LIMIT" --timeout 10 --worker 3 --output results/xss/dalfox.txt || true
-          fi
-          # SQLMap (مشروط)
-          if [ "${{ github.event.inputs.enable_sqlmap }}" = "true" ] && [ -s results/params/parameterized.txt ]; then
-            head -10 results/params/parameterized.txt > /tmp/sqlmap_targets.txt
-            while read -r url; do
-              timeout 60 python3 $SQLMAP_PATH -u "$url" --batch --level=1 --risk=1 --output-dir=results/sqlmap --timeout=10 --retries=1 --threads=2 --random-agent --flush-session 2>/dev/null || true
-            done < /tmp/sqlmap_targets.txt
-          fi
-          # Corsy
-          if [ -s results/urls/all.txt ]; then
-            head -20 results/urls/all.txt > /tmp/corsy_targets.txt
-            python3 /opt/corsy/corsy.py -i /tmp/corsy_targets.txt -t 10 -o results/corsy/report.txt 2>/dev/null || true
-          fi
-      - name: Upload XSS Results
-        uses: actions/upload-artifact@v4
-        with: { name: xss-results, path: results/xss/ }
-      - name: Upload SQLMap Results
-        uses: actions/upload-artifact@v4
-        with: { name: sqlmap-results, path: results/sqlmap/ }
-      - name: Upload Other Results
-        uses: actions/upload-artifact@v4
-        with: { name: other-results, path: results/ }
+          mkdir -p \
+            "$RESULTS_DIR/urls" \
+            "$RESULTS_DIR/params"
 
-  # ============================================================
-  # المرحلة 4: ZAP + التقرير النهائي (يعمل بعد اكتمال كل المهام)
-  # ============================================================
-  zap-and-summary:
-    needs: [port-scanning, nuclei-scan, secrets-scan, xss-sqlmap-scan]
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v4
-        with: { path: results/ }
-      - name: Run ZAP Baseline
-        run: |
-          mkdir -p results/zap
-          docker run --rm -v "$PWD/results/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "https://$TARGET" -r zap-baseline.html -J zap-baseline.json -w zap-baseline.md -m 10 || true
-      - name: Run ZAP Active (Conditional)
-        if: ${{ github.event.inputs.active_scan == 'true' }}
-        run: |
-          docker run --rm -v "$PWD/results/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t "https://$TARGET" -r zap-full.html -J zap-full.json -w zap-full.md -m 30 || true
-      - name: Create Summary
-        run: |
-          {
-            echo "# 🛡️ Security Assessment Report"
-            echo "**Target:** \`$TARGET\`"
-            echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
-            echo "## 📊 Counts"
-            printf "| Subdomains (resolved) | %s |\n" "$(wc -l < results/subdomains/all.txt 2>/dev/null || echo 0)"
-            printf "| Live hosts | %s |\n" "$(wc -l < results/http/live.txt 2>/dev/null || echo 0)"
-            printf "| Open ports | %s |\n" "$(wc -l < results/ports/naabu.txt 2>/dev/null || echo 0)"
-            printf "| URLs | %s |\n" "$(wc -l < results/urls/all.txt 2>/dev/null || echo 0)"
-            printf "| JS files | %s |\n" "$(wc -l < results/js/javascript.txt 2>/dev/null || echo 0)"
-            printf "| Nuclei findings | %s |\n" "$(wc -l < results/nuclei/nuclei.txt 2>/dev/null || echo 0)"
-            printf "| XSS findings | %s |\n" "$(wc -l < results/xss/dalfox.txt 2>/dev/null || echo 0)"
-            printf "| TruffleHog findings | %s |\n" "$(wc -l < results/trufflehog/findings.json 2>/dev/null || echo 0)"
-          } > results/SUMMARY.md
-      - name: Upload Final Results
+          touch \
+            "$RESULTS_DIR/urls/gau.txt" \
+            "$RESULTS_DIR/urls/wayback.txt" \
+            "$RESULTS_DIR/urls/katana.txt" \
+            "$RESULTS_DIR/urls/gospider.txt"
+
+          if [[ -s "$RESULTS_DIR/subdomains/all.txt" ]]; then
+
+            gau \
+              --threads 5 \
+              < "$RESULTS_DIR/subdomains/all.txt" \
+              > "$RESULTS_DIR/urls/gau.txt" \
+              || true
+
+            waybackurls \
+              < "$RESULTS_DIR/subdomains/all.txt" \
+              > "$RESULTS_DIR/urls/wayback.txt" \
+              || true
+          fi
+
+          if [[ -s "$RESULTS_DIR/http/live.txt" ]]; then
+
+            katana \
+              -list "$RESULTS_DIR/http/live.txt" \
+              -silent \
+              -d 3 \
+              -jc \
+              -kf all \
+              -aff \
+              -rate-limit "$RATE_LIMIT" \
+              -o "$RESULTS_DIR/urls/katana.txt" \
+              || true
+
+            gospider \
+              -S "$RESULTS_DIR/http/live.txt" \
+              -c 5 \
+              -d 2 \
+              -t 10 \
+              --sitemap \
+              --robots \
+              --other-source \
+              --include-subs \
+              -o "$RESULTS_DIR/urls/gospider" \
+              || true
+
+            find "$RESULTS_DIR/urls/gospider" \
+              -type f \
+              -name '*.txt' \
+              -exec cat {} \; 2>/dev/null \
+              | grep -oE 'https?://[^ ]+' \
+              | sort -u \
+              > "$RESULTS_DIR/urls/gospider.txt" \
+              || true
+          fi
+
+          cat \
+            "$RESULTS_DIR/urls/gau.txt" \
+            "$RESULTS_DIR/urls/wayback.txt" \
+            "$RESULTS_DIR/urls/katana.txt" \
+            "$RESULTS_DIR/urls/gospider.txt" \
+            2>/dev/null \
+            | grep -E '^https?://' \
+            | sort -u \
+            > "$RESULTS_DIR/urls/all-raw.txt" \
+            || true
+
+          if [[ -s "$RESULTS_DIR/urls/all-raw.txt" ]]; then
+            uro \
+              < "$RESULTS_DIR/urls/all-raw.txt" \
+              > "$RESULTS_DIR/urls/all.txt" \
+              || cp \
+                "$RESULTS_DIR/urls/all-raw.txt" \
+                "$RESULTS_DIR/urls/all.txt"
+          else
+            touch "$RESULTS_DIR/urls/all.txt"
+          fi
+
+          grep '?' \
+            "$RESULTS_DIR/urls/all.txt" \
+            | sort -u \
+            > "$RESULTS_DIR/params/parameterized.txt" \
+            || true
+
+          if [[ -s "$RESULTS_DIR/params/parameterized.txt" ]]; then
+
+            unfurl -u keys \
+              < "$RESULTS_DIR/params/parameterized.txt" \
+              | tr ',' '\n' \
+              | sort -u \
+              > "$RESULTS_DIR/params/unique-keys.txt" \
+              || true
+
+          else
+            touch "$RESULTS_DIR/params/unique-keys.txt"
+          fi
+
+          echo "URLs:"
+          wc -l "$RESULTS_DIR/urls/all.txt"
+
+          echo "Parameterized URLs:"
+          wc -l "$RESULTS_DIR/params/parameterized.txt"
+
+      - name: Upload URLs
         uses: actions/upload-artifact@v4
         with:
-          name: full-security-assessment
+          name: urls
+          path: results/urls/
+          retention-days: 14
+
+      - name: Upload parameters
+        uses: actions/upload-artifact@v4
+        with:
+          name: parameters
+          path: results/params/
+          retention-days: 14
+
+
+# ============================================================
+# 5. NUCLEI
+# ============================================================
+
+  nuclei-scan:
+    name: Nuclei Vulnerability Assessment
+    needs: http-discovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: http-discovery
+          path: results/http/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install Nuclei
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Update templates
+        run: |
+          nuclei -update-templates || true
+
+      - name: Run Nuclei
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RESULTS_DIR/nuclei"
+
+          if [[ ! -s "$RESULTS_DIR/http/live.txt" ]]; then
+            touch "$RESULTS_DIR/nuclei/nuclei.jsonl"
+            touch "$RESULTS_DIR/nuclei/nuclei.txt"
+            exit 0
+          fi
+
+          nuclei \
+            -l "$RESULTS_DIR/http/live.txt" \
+            -severity info,low,medium,high,critical \
+            -exclude-tags dos,fuzz \
+            -rate-limit "$NUCLEI_RATE_LIMIT" \
+            -bulk-size 10 \
+            -c 5 \
+            -jsonl \
+            -o "$RESULTS_DIR/nuclei/nuclei.jsonl" \
+            || true
+
+          if [[ -s "$RESULTS_DIR/nuclei/nuclei.jsonl" ]]; then
+
+            jq -r '
+              [
+                .info.severity,
+                .info.name,
+                ."matched-at"
+              ] | @tsv
+            ' "$RESULTS_DIR/nuclei/nuclei.jsonl" \
+            > "$RESULTS_DIR/nuclei/nuclei.txt" \
+            || true
+
+          fi
+
+      - name: Upload Nuclei
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei
+          path: results/nuclei/
+          retention-days: 14
+
+
+# ============================================================
+# 6. JAVASCRIPT / SECRETS
+# ============================================================
+
+  javascript-analysis:
+    name: JavaScript & Secret Analysis
+    needs: url-discovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: urls
+          path: results/urls/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+
+          npm install -g retire
+
+          pip install --break-system-packages \
+            jsbeautifier
+
+          curl -sSfL \
+            https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+          git clone --depth 1 \
+            https://github.com/GerbenJavado/LinkFinder.git \
+            /tmp/linkfinder
+
+          pip install --break-system-packages \
+            -r /tmp/linkfinder/requirements.txt
+
+          git clone --depth 1 \
+            https://github.com/m4ll0k/SecretFinder.git \
+            /tmp/secretfinder
+
+          pip install --break-system-packages \
+            -r /tmp/secretfinder/requirements.txt
+
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Download JavaScript
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "$RESULTS_DIR/js/files" \
+            "$RESULTS_DIR/linkfinder" \
+            "$RESULTS_DIR/secretfinder" \
+            "$RESULTS_DIR/secrets" \
+            "$RESULTS_DIR/trufflehog" \
+            "$RESULTS_DIR/retire"
+
+          grep -Ei \
+            '\.js([?#].*)?$' \
+            "$RESULTS_DIR/urls/all.txt" \
+            | sort -u \
+            | head -n "$MAX_JS_FILES" \
+            > "$RESULTS_DIR/js/javascript.txt" \
+            || true
+
+          while IFS= read -r url; do
+
+            [[ -z "$url" ]] && continue
+
+            hash="$(
+              printf '%s' "$url" |
+              sha256sum |
+              cut -d' ' -f1
+            )"
+
+            curl \
+              -Lks \
+              --max-time 20 \
+              -A "Mozilla/5.0 SecurityAssessment" \
+              "$url" \
+              -o "$RESULTS_DIR/js/files/$hash.js" \
+              || true
+
+          done < "$RESULTS_DIR/js/javascript.txt"
+
+      - name: LinkFinder
+        run: |
+          set -euo pipefail
+
+          touch "$RESULTS_DIR/linkfinder/endpoints.txt"
+
+          for file in "$RESULTS_DIR"/js/files/*.js; do
+
+            [[ -s "$file" ]] || continue
+
+            python3 \
+              /tmp/linkfinder/linkfinder.py \
+              -i "$file" \
+              -o cli \
+              >> "$RESULTS_DIR/linkfinder/endpoints.txt" \
+              2>/dev/null \
+              || true
+
+          done
+
+      - name: SecretFinder
+        run: |
+          set -euo pipefail
+
+          touch "$RESULTS_DIR/secretfinder/secrets.txt"
+
+          for file in "$RESULTS_DIR"/js/files/*.js; do
+
+            [[ -s "$file" ]] || continue
+
+            python3 \
+              /tmp/secretfinder/SecretFinder.py \
+              -i "$file" \
+              -o cli \
+              >> "$RESULTS_DIR/secretfinder/secrets.txt" \
+              2>/dev/null \
+              || true
+
+          done
+
+      - name: Generic secret patterns
+        run: |
+          grep -RniE \
+            'api[_-]?key|client[_-]?secret|password|bearer|access[_-]?token|aws_access|private[_-]?key' \
+            "$RESULTS_DIR/js/files" \
+            > "$RESULTS_DIR/secrets/js-interesting.txt" \
+            2>/dev/null \
+            || true
+
+      - name: TruffleHog
+        run: |
+          trufflehog filesystem \
+            "$RESULTS_DIR/js/files" \
+            --json \
+            > "$RESULTS_DIR/trufflehog/findings.json" \
+            2>/dev/null \
+            || true
+
+      - name: Retire.js
+        run: |
+          retire \
+            --path "$RESULTS_DIR/js/files" \
+            --outputformat json \
+            --outputpath "$RESULTS_DIR/retire/retire.json" \
+            --exitwith 0 \
+            || true
+
+      - name: Upload JavaScript analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: javascript-analysis
           path: results/
           retention-days: 14
+
+
+# ============================================================
+# 7. WEB SECURITY CONFIGURATION
+# ============================================================
+
+  web-security:
+    name: Web Security Configuration
+    needs: http-discovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: http-discovery
+          path: results/http/
+
+      - name: Analyze security headers
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RESULTS_DIR/web-security"
+
+          while IFS= read -r url; do
+
+            [[ -z "$url" ]] && continue
+
+            hash="$(
+              printf '%s' "$url" |
+              sha256sum |
+              cut -d' ' -f1
+            )"
+
+            curl \
+              -ksS \
+              -D "$RESULTS_DIR/web-security/$hash.headers" \
+              -o /dev/null \
+              --max-time 15 \
+              "$url" \
+              || true
+
+          done < "$RESULTS_DIR/http/live.txt"
+
+          {
+            echo "# Web Security Observations"
+            echo
+
+            for file in "$RESULTS_DIR"/web-security/*.headers; do
+
+              [[ -s "$file" ]] || continue
+
+              echo "## $(basename "$file")"
+
+              for header in \
+                strict-transport-security \
+                content-security-policy \
+                x-content-type-options \
+                x-frame-options \
+                referrer-policy \
+                permissions-policy; do
+
+                if grep -qi "^$header:" "$file"; then
+                  echo "- $header: present"
+                else
+                  echo "- $header: missing"
+                fi
+
+              done
+
+              echo
+            done
+
+          } > "$RESULTS_DIR/web-security/report.md"
+
+      - name: Upload web security
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-security
+          path: results/web-security/
+          retention-days: 14
+
+
+# ============================================================
+# 8. CONTROLLED ACTIVE PARAMETER TESTING
+# ============================================================
+
+  active-parameter-testing:
+    name: Controlled Active Parameter Testing
+
+    needs:
+      - initialize
+      - url-discovery
+
+    if: >
+      needs.initialize.outputs.active_scan == 'true' &&
+      (
+        needs.initialize.outputs.sqlmap == 'true' ||
+        needs.initialize.outputs.xss == 'true'
+      )
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: parameters
+          path: results/params/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install active testing tools
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+
+          go install github.com/hahwul/dalfox/v2@latest
+
+          git clone --depth 1 \
+            https://github.com/sqlmapproject/sqlmap.git \
+            /opt/sqlmap
+
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          echo "SQLMAP_PATH=/opt/sqlmap/sqlmap.py" >> "$GITHUB_ENV"
+
+      - name: Prepare targets
+        env:
+          LIMIT: ${{ needs.initialize.outputs.max_urls }}
+
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            "$RESULTS_DIR/xss" \
+            "$RESULTS_DIR/sqlmap"
+
+          if [[ -s "$RESULTS_DIR/params/parameterized.txt" ]]; then
+
+            head -n "$LIMIT" \
+              "$RESULTS_DIR/params/parameterized.txt" \
+              > /tmp/active-targets.txt
+
+          else
+            touch /tmp/active-targets.txt
+          fi
+
+      - name: Dalfox XSS testing
+        if: needs.initialize.outputs.xss == 'true'
+        run: |
+          set -euo pipefail
+
+          if [[ -s /tmp/active-targets.txt ]]; then
+
+            dalfox pipe \
+              --silence \
+              --no-color \
+              --rate-limit "$RATE_LIMIT" \
+              --timeout 10 \
+              --worker 3 \
+              < /tmp/active-targets.txt \
+              > "$RESULTS_DIR/xss/dalfox.txt" \
+              || true
+
+          fi
+
+      - name: SQLMap testing
+        if: needs.initialize.outputs.sqlmap == 'true'
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s /tmp/active-targets.txt ]]; then
+            exit 0
+          fi
+
+          while IFS= read -r url; do
+
+            [[ -z "$url" ]] && continue
+
+            timeout 60 \
+              python3 "$SQLMAP_PATH" \
+                -u "$url" \
+                --batch \
+                --level=1 \
+                --risk=1 \
+                --timeout=10 \
+                --retries=1 \
+                --threads=2 \
+                --random-agent \
+                --flush-session \
+                --output-dir="$RESULTS_DIR/sqlmap" \
+                || true
+
+          done < /tmp/active-targets.txt
+
+      - name: Upload active results
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-parameter-testing
+          path: results/
+          retention-days: 14
+
+
+# ============================================================
+# 9. OWASP ZAP
+# ============================================================
+
+  zap:
+    name: OWASP ZAP Assessment
+    needs:
+      - initialize
+      - http-discovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare directory
+        run: |
+          mkdir -p "$RESULTS_DIR/zap"
+
+      - name: ZAP Baseline
+        env:
+          TARGET: ${{ needs.initialize.outputs.target }}
+
+        run: |
+          docker run --rm \
+            -v "$PWD/results/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t "$TARGET" \
+            -r zap-baseline.html \
+            -J zap-baseline.json \
+            -w zap-baseline.md \
+            -m 10 \
+            || true
+
+      - name: ZAP Active Scan
+        if: needs.initialize.outputs.zap_active == 'true'
+        env:
+          TARGET: ${{ needs.initialize.outputs.target }}
+
+        run: |
+          docker run --rm \
+            -v "$PWD/results/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t "$TARGET" \
+            -r zap-full.html \
+            -J zap-full.json \
+            -w zap-full.md \
+            -m 30 \
+            || true
+
+      - name: Upload ZAP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap
+          path: results/zap/
+          retention-days: 14
+
+
+# ============================================================
+# 10. FINAL REPORT
+# ============================================================
+
+  consolidate:
+    name: Consolidated Security Report
+
+    needs:
+      - initialize
+      - subdomain-enumeration
+      - http-discovery
+      - port-scanning
+      - url-discovery
+      - nuclei-scan
+      - javascript-analysis
+      - web-security
+      - zap
+      - active-parameter-testing
+
+    if: always()
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: collected/
+
+      - name: Generate statistics
+        run: |
+          set -euo pipefail
+
+          mkdir -p final
+
+          subdomains="$(
+            find collected \
+              -path '*/subdomains/all.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | sort -u \
+              | wc -l
+          )"
+
+          live="$(
+            find collected \
+              -path '*/http/live.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | sort -u \
+              | wc -l
+          )"
+
+          urls="$(
+            find collected \
+              -path '*/urls/all.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | sort -u \
+              | wc -l
+          )"
+
+          params="$(
+            find collected \
+              -path '*/params/parameterized.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | sort -u \
+              | wc -l
+          )"
+
+          nuclei="$(
+            find collected \
+              -name 'nuclei.jsonl' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | wc -l
+          )"
+
+          xss="$(
+            find collected \
+              -name 'dalfox.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | wc -l
+          )"
+
+          cat > final/SUMMARY.md <<EOF
+          # Security Assessment Report
+
+          ## Target
+
+          \`${{ needs.initialize.outputs.target }}\`
+
+          ## Assessment
+
+          - Repository: $GITHUB_REPOSITORY
+          - Commit: $GITHUB_SHA
+          - Run ID: $GITHUB_RUN_ID
+          - Date: $(date -u '+%Y-%m-%d %H:%M UTC')
+          - Active scanning: ${{ needs.initialize.outputs.active_scan }}
+          - SQLMap: ${{ needs.initialize.outputs.sqlmap }}
+          - XSS: ${{ needs.initialize.outputs.xss }}
+          - ZAP active: ${{ needs.initialize.outputs.zap_active }}
+
+          ## Discovery
+
+          | Metric | Count |
+          |---|---:|
+          | Resolved subdomains | $subdomains |
+          | Live HTTP services | $live |
+          | Discovered URLs | $urls |
+          | Parameterized URLs | $params |
+          | Nuclei events | $nuclei |
+          | XSS scanner events | $xss |
+
+          ## Interpretation
+
+          Automated scanner output is not automatically a confirmed vulnerability.
+
+          Each interesting result should be manually validated, reproduced,
+          assessed for impact, and checked against the authorized scope
+          before being reported.
+
+          ## Collected data
+
+          - Subdomain/DNS discovery
+          - HTTP fingerprinting
+          - Port/service discovery
+          - URL/endpoint discovery
+          - Parameter discovery
+          - Nuclei
+          - JavaScript analysis
+          - Secret detection
+          - Security-header analysis
+          - OWASP ZAP
+          - Controlled active parameter testing
+          EOF
+
+      - name: Generate findings index
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Findings Index"
+            echo
+
+            echo "## Nuclei"
+            find collected \
+              -name 'nuclei.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | sort -u \
+              | head -500 \
+              || true
+
+            echo
+            echo "## XSS"
+            find collected \
+              -name 'dalfox.txt' \
+              -type f \
+              -exec cat {} \; \
+              2>/dev/null \
+              | sort -u \
+              | head -500 \
+              || true
+
+            echo
+            echo "## Secret-related artifacts"
+            find collected \
+              \( \
+                -name 'findings.json' \
+                -o \
+                -name 'js-interesting.txt' \
+                -o \
+                -name 'secrets.txt' \
+              \) \
+              -type f \
+              | sort
+
+            echo
+            echo "## ZAP"
+            find collected \
+              -iname '*zap*.json' \
+              -o \
+              -iname '*zap*.md' \
+              -o \
+              -iname '*zap*.html' \
+              | sort
+
+          } > final/FINDINGS.md
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+
+          find collected \
+            -type f \
+            -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            > final/SHA256SUMS.txt \
+            || true
+
+      - name: Upload final assessment
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-assessment-final
+          path: |
+            final/
+            collected/
+          retention-days: 30
